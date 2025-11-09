@@ -856,11 +856,11 @@ def train_residual_encoder(
     for _ in range(start_epoch):
         sched.step()
 
-    # Warm-up: no attacks for first few epochs
-    warmup_epochs = max(2, epochs // 5)      # e.g., 2 for 10 epochs
-    # Residual penalty ramp: start light, end around 0.025
+    # Warm-up: no attacks for longer to build strong base
+    warmup_epochs = max(8, epochs // 3)      # ~40% of training without attacks
+    # Residual penalty ramp: start very light, grow slowly
     def residual_weight(e):
-        return 0.005 + 0.015 * min(1.0, e / max(1, epochs - 1))
+        return 0.003 + 0.012 * min(1.0, e / max(1, epochs - 1))
 
     last_epoch_ema = ema_acc if start_epoch > 0 else None
     for epoch in range(start_epoch + 1, epochs + 1):
@@ -869,10 +869,21 @@ def train_residual_encoder(
 
         curriculum_progress = 0.0
         if curriculum and epoch > warmup_epochs:
-            curriculum_progress = min(1.0, (epoch - warmup_epochs) / max(1, epochs - warmup_epochs))
+            # Much slower attack ramping: square root makes it grow slower initially
+            raw_progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
+            curriculum_progress = math.sqrt(raw_progress)  # slower initial growth
+        
+        # Strong damping if accuracy drops
         severity_dampen = 1.0
-        if last_epoch_ema is not None and ema_acc < last_epoch_ema - 0.05:
-            severity_dampen = 0.7
+        if last_epoch_ema is not None:
+            acc_drop = last_epoch_ema - ema_acc
+            if acc_drop > 0.08:  # significant drop
+                severity_dampen = 0.5
+            elif acc_drop > 0.05:  # moderate drop
+                severity_dampen = 0.7
+            elif acc_drop > 0.02:  # small drop
+                severity_dampen = 0.85
+        
         adjusted_progress = curriculum_progress * severity_dampen
 
         for imgs in pbar:
@@ -894,15 +905,28 @@ def train_residual_encoder(
                 # Attacked path
                 if epoch <= warmup_epochs or not curriculum:
                     attacked = watermarked_clamped
+                    # During warmup, focus heavily on clean accuracy
+                    attack_weight = 0.5  # reduce importance of attacked path during warmup
                 else:
-                    attack_strength = min(adjusted_progress, attack_limit)
-                    attacked = attack(watermarked_clamped, severity=attack_strength)
-                    if random.random() < 0.6 + 0.25 * attack_strength:
-                        noise_mag = 0.006 + 0.03 * attack_strength
+                    # Start with very weak attacks
+                    attack_strength = min(adjusted_progress * 0.5, attack_limit)  # cap at 50% of progress
+                    attack_weight = 0.8 + 0.2 * min(1.0, attack_strength / 0.2)  # gradually increase attacked weight
+                    
+                    # Apply attacks with probability based on strength
+                    if random.random() < 0.5 + 0.3 * attack_strength:
+                        attacked = attack(watermarked_clamped, severity=attack_strength)
+                    else:
+                        attacked = watermarked_clamped
+                    
+                    # Add light noise more conservatively
+                    if random.random() < 0.4 + 0.2 * attack_strength:
+                        noise_mag = 0.004 + 0.015 * attack_strength
                         attacked = torch.clamp(attacked + torch.randn_like(attacked) * noise_mag, 0, 1)
-                    if attack_strength > 0.35 and random.random() < 0.15 + 0.35 * max(0.0, attack_strength - 0.35):
-                        sigma = random.uniform(0.35, 1.1) * (1.0 + 0.5 * attack_strength)
-                        attacked = TF.gaussian_blur(attacked, kernel_size=5, sigma=sigma)
+                    
+                    # Only add blur at higher attack strengths
+                    if attack_strength > 0.25 and random.random() < 0.1 + 0.25 * max(0.0, attack_strength - 0.25):
+                        sigma = random.uniform(0.25, 0.8) * (1.0 + 0.3 * attack_strength)
+                        attacked = TF.gaussian_blur(attacked, kernel_size=3, sigma=sigma)
 
                 logits_att = dec(attacked)
                 bce_att = F.binary_cross_entropy_with_logits(logits_att, target_bits)
@@ -911,14 +935,16 @@ def train_residual_encoder(
                 res_l2 = (residual ** 2).mean()
                 lam = residual_weight(epoch - 1)   # epoch-1 so epoch1 uses smallest weight
 
-                # Total loss: attacked + half clean + residual penalty
-                loss = bce_att + 0.5 * bce_clean + lam * res_l2
+                # Total loss: balance between clean and attacked, with residual penalty
+                # During early training, prioritize clean accuracy more
+                clean_weight = 1.0 if epoch <= warmup_epochs else 0.6
+                loss = attack_weight * bce_att + clean_weight * bce_clean + lam * res_l2
 
             if not torch.isfinite(loss):
                 print(f"⚠️ Non-finite loss encountered at epoch {epoch} (attack_cap={attack_limit:.2f}). Reducing attack intensity.")
-                attack_limit = max(0.25, attack_limit * 0.7)
+                attack_limit = max(0.20, attack_limit * 0.6)
                 opt.zero_grad(set_to_none=True)
-                scaler.update()
+                # Skip scaler.update() - it requires a prior step() call
                 continue
 
             opt.zero_grad(set_to_none=True)
@@ -945,13 +971,21 @@ def train_residual_encoder(
                 atkCap=f"{attack_limit:.2f}"
             )
 
-        if ema_acc < 0.55 and attack_limit > 0.3:
-            attack_limit = max(0.3, attack_limit * 0.9)
-        if residual_ema > 0.14 and attack_limit > 0.28:
-            attack_limit = max(0.28, attack_limit * 0.9)
-        if last_epoch_ema is not None and ema_acc > last_epoch_ema + 0.01 and residual_ema < 0.11:
-            attack_limit = min(max_attack_strength, attack_limit + 0.02)
-        attack_limit = float(max(0.25, min(max_attack_strength, attack_limit)))
+        # Dynamic attack cap adjustment - more conservative
+        if ema_acc < 0.60 and attack_limit > 0.25:
+            attack_limit = max(0.25, attack_limit * 0.85)
+            print(f"📉 Accuracy low ({ema_acc*100:.1f}%), reducing attack_cap to {attack_limit:.2f}")
+        
+        if residual_ema > 0.13 and attack_limit > 0.25:
+            attack_limit = max(0.25, attack_limit * 0.90)
+            print(f"📊 High residual ({residual_ema:.4f}), reducing attack_cap to {attack_limit:.2f}")
+        
+        # Only increase attack if both accuracy AND residual are good
+        if last_epoch_ema is not None and ema_acc > max(0.65, last_epoch_ema + 0.02) and residual_ema < 0.10:
+            attack_limit = min(max_attack_strength, attack_limit + 0.015)
+            print(f"📈 Good progress, increasing attack_cap to {attack_limit:.2f}")
+        
+        attack_limit = float(max(0.20, min(max_attack_strength, attack_limit)))
 
         sched.step()
         if ema_acc > best_ema:
