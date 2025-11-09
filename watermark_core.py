@@ -33,6 +33,8 @@ from torch.utils.data import Dataset, DataLoader
 
 import torchvision.models as models
 import torchvision.transforms as T
+import torchvision.transforms.functional as TF
+from torchvision.transforms.functional import InterpolationMode
 
 import torch.backends.cudnn as cudnn
 from tqdm import tqdm
@@ -468,24 +470,44 @@ def attack_patch_replace(img, size=0.15):
 # Learned Encoder/Decoder (112 bits)
 # =========================
 class Encoder(nn.Module):
-    def __init__(self, in_channels=3, hidden=64, payload_len=112):
+    def __init__(self, in_channels=3, hidden=128, payload_len=112):
         super().__init__()
         self.hidden = hidden
         self.payload_len = payload_len
         self.payload_embed = nn.Sequential(
-            nn.Linear(payload_len, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU()
+            nn.Linear(payload_len, hidden * 2),
+            nn.SiLU(),
+            nn.Linear(hidden * 2, hidden),
+            nn.SiLU()
         )
         self.down1 = nn.Sequential(
-            nn.Conv2d(in_channels + hidden, hidden, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(hidden, hidden, 3, padding=1), nn.ReLU()
+            nn.Conv2d(in_channels + hidden, hidden, 3, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU()
         )
         self.pool = nn.MaxPool2d(2)
         self.down2 = nn.Sequential(
-            nn.Conv2d(hidden, hidden * 2, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(hidden * 2, hidden * 2, 3, padding=1), nn.ReLU()
+            nn.Conv2d(hidden, hidden * 2, 3, padding=1),
+            nn.BatchNorm2d(hidden * 2),
+            nn.SiLU(),
+            nn.Conv2d(hidden * 2, hidden * 2, 3, padding=1, dilation=2),
+            nn.BatchNorm2d(hidden * 2),
+            nn.SiLU()
         )
-        self.up1 = nn.Sequential(nn.ConvTranspose2d(hidden * 2, hidden, 2, stride=2), nn.ReLU())
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(hidden * 2, hidden, 2, stride=2),
+            nn.SiLU()
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(hidden * 2, hidden, 3, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.SiLU()
+        )
         self.out_conv = nn.Conv2d(hidden, in_channels, 1)
 
     def forward(self, x, payload_bits):
@@ -498,25 +520,36 @@ class Encoder(nn.Module):
         p = self.pool(d1)
         d2 = self.down2(p)
         u = self.up1(d2)
-        r = u + d1
-        # slightly stronger residual than 0.1 (bit recovery boost)
-        res = torch.tanh(self.out_conv(r)) * 0.15
+        fused = torch.cat([u, d1], dim=1)
+        r = self.fuse(fused)
+        res = torch.tanh(self.out_conv(r)) * 0.2
         return res
 
 class Decoder(nn.Module):
-    def __init__(self, in_channels=3, payload_len=112, hidden=64):
+    def __init__(self, in_channels=3, payload_len=112, hidden=128):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, hidden, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((16, 16))
+            nn.Conv2d(in_channels, hidden, 3, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, hidden, 3, stride=2, padding=1),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, hidden * 2, 3, stride=2, padding=1),
+            nn.BatchNorm2d(hidden * 2),
+            nn.SiLU()
         )
+        self.pool = nn.AdaptiveAvgPool2d((8, 8))
         self.fc = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(hidden * 16 * 16, 512), nn.ReLU(),
-            nn.Linear(512, payload_len)
+            nn.Linear(hidden * 2 * 8 * 8, 1024),
+            nn.SiLU(),
+            nn.Dropout(0.2),
+            nn.Linear(1024, payload_len)
         )
     def forward(self, x):
         f = self.conv(x)
+        f = self.pool(f)
         out = self.fc(f)
         return out  # raw logits (use BCEWithLogitsLoss)
 
@@ -526,18 +559,70 @@ class Decoder(nn.Module):
 class DifferentiableAttack(nn.Module):
     def __init__(self):
         super().__init__()
-    def forward(self, imgs):
+    def forward(self, imgs, severity: float = 1.0):
         x = imgs
-        # small random resize (down & back)
-        if random.random() < 0.8:
-            h, w = x.shape[2:]
-            scale = random.uniform(0.85, 1.0)
-            nh, nw = int(h * scale), int(w * scale)
+        severity = float(max(0.0, min(1.0, severity)))
+        b, c, h, w = x.shape
+
+        # random affine jitter (rotation / translation / scale / shear)
+        if random.random() < 0.4 + 0.4 * severity:
+            angle = random.uniform(-10, 10) * severity
+            translate = (
+                int(random.uniform(-0.08, 0.08) * severity * w),
+                int(random.uniform(-0.08, 0.08) * severity * h),
+            )
+            scale = random.uniform(0.75, 1.05)
+            shear_x = random.uniform(-8, 8) * severity
+            shear_y = random.uniform(-8, 8) * severity
+            x = TF.affine(
+                x,
+                angle=angle,
+                translate=translate,
+                scale=scale,
+                shear=(shear_x, shear_y),
+                interpolation=InterpolationMode.BILINEAR,
+                fill=0.5,
+            )
+
+        # multi-scale blur / down-up sampling
+        if random.random() < 0.5 + 0.3 * severity:
+            scale = random.uniform(max(0.55, 0.85 - 0.3 * severity), 1.0)
+            nh, nw = max(4, int(h * scale)), max(4, int(w * scale))
             x = F.interpolate(x, size=(nh, nw), mode="bilinear", align_corners=False)
             x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
+
+        if random.random() < 0.25 + 0.5 * severity:
+            sigma = random.uniform(0.2, 1.2 * (1.0 + severity))
+            x = TF.gaussian_blur(x, kernel_size=3, sigma=sigma)
+
+        if random.random() < 0.3 + 0.4 * severity:
+            contrast = random.uniform(0.7, 1.3)
+            x = torch.clamp(TF.adjust_contrast(x, contrast), 0.0, 1.0)
+
+        if random.random() < 0.3 + 0.4 * severity:
+            gamma = random.uniform(0.8, 1.3)
+            x = torch.clamp(TF.adjust_gamma(x, gamma), 0.0, 1.0)
+
+        if random.random() < 0.25 + 0.4 * severity:
+            saturation = random.uniform(0.6, 1.4)
+            x = torch.clamp(TF.adjust_saturation(x, saturation), 0.0, 1.0)
+
+        if random.random() < 0.2 + 0.3 * severity:
+            hue = random.uniform(-0.04, 0.04)
+            x = torch.clamp(TF.adjust_hue(x, hue), 0.0, 1.0)
+
+        # channel drop / mix
+        if random.random() < 0.2 * severity:
+            mask = torch.ones_like(x)
+            ch = random.randrange(c)
+            mask[:, ch, :, :] = mask[:, ch, :, :].mul(0.0)
+            x = x * mask
+
         # light gaussian noise
-        if random.random() < 0.5:
-            x = torch.clamp(x + torch.randn_like(x) * 0.01, 0, 1)
+        if random.random() < 0.6 + 0.3 * severity:
+            noise_level = 0.01 + 0.03 * severity
+            x = torch.clamp(x + torch.randn_like(x) * noise_level, 0, 1)
+
         return x
 
 # =========================
@@ -553,7 +638,7 @@ class SimpleImageFolder(Dataset):
     """
     IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
-    def __init__(self, root_dir: Union[str, Path], image_size: int = 256, cache_to_ram: bool = False):
+    def __init__(self, root_dir: Union[str, Path], image_size: int = 256, cache_to_ram: bool = False, augment: bool = True):
         super().__init__()
         self.root_dir = Path(root_dir)
         if not self.root_dir.exists():
@@ -567,6 +652,7 @@ class SimpleImageFolder(Dataset):
 
         self.image_size = int(image_size)
         self.cache_to_ram = bool(cache_to_ram)
+        self.augment = bool(augment)
         self._cache: List[torch.Tensor] = []
         if self.cache_to_ram:
             print("⚡ Pre-loading images into RAM …")
@@ -598,10 +684,71 @@ class SimpleImageFolder(Dataset):
         ten = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
         return ten
 
+    def _apply_augmentations(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not self.augment:
+            return tensor
+
+        x = tensor
+        if torch.rand(1).item() < 0.5:
+            x = torch.flip(x, dims=[2])
+        if torch.rand(1).item() < 0.1:
+            x = torch.flip(x, dims=[1])
+
+        if torch.rand(1).item() < 0.6:
+            angle = float(torch.empty(1).uniform_(-8, 8))
+            translate = (
+                int(float(torch.empty(1).uniform_(-0.08, 0.08)) * x.shape[2]),
+                int(float(torch.empty(1).uniform_(-0.08, 0.08)) * x.shape[1]),
+            )
+            scale = float(torch.empty(1).uniform_(0.85, 1.05))
+            shear_x = float(torch.empty(1).uniform_(-6, 6))
+            shear_y = float(torch.empty(1).uniform_(-6, 6))
+            x = TF.affine(
+                x,
+                angle=angle,
+                translate=translate,
+                scale=scale,
+                shear=(shear_x, shear_y),
+                interpolation=InterpolationMode.BILINEAR,
+                fill=0.5,
+            )
+
+        if torch.rand(1).item() < 0.5:
+            brightness = float(torch.empty(1).uniform_(0.85, 1.15))
+            x = torch.clamp(TF.adjust_brightness(x, brightness), 0.0, 1.0)
+        if torch.rand(1).item() < 0.5:
+            contrast = float(torch.empty(1).uniform_(0.8, 1.2))
+            x = torch.clamp(TF.adjust_contrast(x, contrast), 0.0, 1.0)
+        if torch.rand(1).item() < 0.4:
+            saturation = float(torch.empty(1).uniform_(0.75, 1.25))
+            x = torch.clamp(TF.adjust_saturation(x, saturation), 0.0, 1.0)
+        if torch.rand(1).item() < 0.3:
+            hue = float(torch.empty(1).uniform_(-0.03, 0.03))
+            x = torch.clamp(TF.adjust_hue(x, hue), 0.0, 1.0)
+
+        if torch.rand(1).item() < 0.3:
+            sigma = float(torch.empty(1).uniform_(0.2, 1.0))
+            x = TF.gaussian_blur(x, kernel_size=3, sigma=sigma)
+
+        if torch.rand(1).item() < 0.35:
+            channel_scale = torch.empty(3, 1, 1).uniform_(0.85, 1.15)
+            x = torch.clamp(x * channel_scale, 0.0, 1.0)
+
+        if torch.rand(1).item() < 0.4:
+            noise = torch.randn_like(x) * float(torch.empty(1).uniform_(0.005, 0.02))
+            x = torch.clamp(x + noise, 0.0, 1.0)
+
+        return x
+
     def __getitem__(self, idx: int) -> torch.Tensor:
         if self.cache_to_ram:
-            return self._cache[int(idx)]
-        return self._load_to_tensor(self.paths[int(idx)])
+            img = self._cache[int(idx)]
+            if self.augment:
+                img = img.clone()
+        else:
+            img = self._load_to_tensor(self.paths[int(idx)])
+        img = self._apply_augmentations(img)
+        return img
 
 # =========================
 # Training loop (fast)
@@ -626,7 +773,7 @@ def train_residual_encoder(
       - BCEWithLogitsLoss + residual L2 regularization
     """
     # ---- Data
-    ds = SimpleImageFolder(root_images, image_size=256, cache_to_ram=cache_to_ram)
+    ds = SimpleImageFolder(root_images, image_size=256, cache_to_ram=cache_to_ram, augment=True)
     num_workers = max(2, (os.cpu_count() or 2) // 2)
     dl = DataLoader(
         ds,
@@ -650,22 +797,27 @@ def train_residual_encoder(
         lr=3e-4,              # was 1e-4
         weight_decay=0.0      # explicitly no WD
     )
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1))
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1), eta_min=1e-5)
     scaler = torch.amp.GradScaler('cuda', enabled=(device == "cuda"))
 
     best_ema = 0.0
     ema_acc = 0.0
     alpha = 0.2
+    residual_ema = 0.0
 
     # Warm-up: no attacks for first few epochs
     warmup_epochs = max(2, epochs // 5)      # e.g., 2 for 10 epochs
-    # Residual penalty ramp: start light, end at 0.05
+    # Residual penalty ramp: start light, end around 0.025
     def residual_weight(e):
-        return 0.01 + 0.04 * min(1.0, e / max(1, epochs - 1))
+        return 0.005 + 0.02 * min(1.0, e / max(1, epochs - 1))
 
     for epoch in range(1, epochs + 1):
         enc.train(); dec.train()
         pbar = tqdm(dl, desc=f"Epoch {epoch}/{epochs}")
+
+        curriculum_progress = 0.0
+        if curriculum and epoch > warmup_epochs:
+            curriculum_progress = min(1.0, (epoch - warmup_epochs) / max(1, epochs - warmup_epochs))
 
         for imgs in pbar:
             imgs = imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -686,10 +838,13 @@ def train_residual_encoder(
                 if epoch <= warmup_epochs or not curriculum:
                     attacked = watermarked_clamped
                 else:
-                    attacked = attack(watermarked_clamped)
-                    if random.random() < 0.7:
-                        noise = torch.randn_like(attacked) * 0.015
-                        attacked = torch.clamp(attacked + noise, 0, 1)
+                    attacked = attack(watermarked_clamped, severity=curriculum_progress)
+                    if random.random() < 0.6 + 0.3 * curriculum_progress:
+                        noise_mag = 0.008 + 0.04 * curriculum_progress
+                        attacked = torch.clamp(attacked + torch.randn_like(attacked) * noise_mag, 0, 1)
+                    if curriculum_progress > 0.4 and random.random() < 0.2 + 0.3 * (curriculum_progress - 0.4):
+                        sigma = random.uniform(0.4, 1.4) * (1.0 + curriculum_progress)
+                        attacked = TF.gaussian_blur(attacked, kernel_size=5, sigma=sigma)
 
                 logits_att = dec(attacked)
                 bce_att = F.binary_cross_entropy_with_logits(logits_att, target_bits)
@@ -708,6 +863,8 @@ def train_residual_encoder(
             scaler.update()
 
             with torch.no_grad():
+                residual_abs = residual.detach().abs().mean().item()
+                residual_ema = 0.1 * residual_abs + 0.9 * residual_ema
                 probs = torch.sigmoid(logits_att)
                 preds = (probs > 0.5).float()
                 bit_acc = preds.eq(target_bits).float().mean().item()
@@ -717,7 +874,8 @@ def train_residual_encoder(
                 loss=f"{loss.item():.4f}",
                 bitAcc=f"{bit_acc*100:.1f}%",
                 EMA=f"{ema_acc*100:.1f}%",
-                lam=f"{lam:.3f}"
+                lam=f"{lam:.3f}",
+                res=f"{residual_ema:.4f}"
             )
 
         sched.step()

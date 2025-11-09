@@ -28,7 +28,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--image_dir', type=str, default=DEFAULT_IMAGE_DIR)
-    parser.add_argument('--epochs', type=int, default=35)  # More epochs
+    parser.add_argument('--epochs', type=int, default=80)  # More epochs for convergence
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--payload_len', type=int, default=112)
