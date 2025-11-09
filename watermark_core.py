@@ -563,7 +563,7 @@ class DifferentiableAttack(nn.Module):
         super().__init__()
     def forward(self, imgs, severity: float = 1.0):
         x = imgs
-        severity = float(max(0.0, min(1.0, severity)))
+        severity = float(max(0.0, min(0.6, severity)))
         b, c, h, w = x.shape
 
         # random affine jitter (rotation / translation / scale / shear)
@@ -593,16 +593,17 @@ class DifferentiableAttack(nn.Module):
             x = F.interpolate(x, size=(nh, nw), mode="bilinear", align_corners=False)
             x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
 
-        if random.random() < 0.25 + 0.5 * severity:
-            sigma = random.uniform(0.2, 1.2 * (1.0 + severity))
+        if random.random() < 0.25 + 0.35 * severity:
+            sigma_min = 0.15
+            sigma = random.uniform(sigma_min, 0.9 + 0.8 * severity)
             x = TF.gaussian_blur(x, kernel_size=3, sigma=sigma)
 
-        if random.random() < 0.3 + 0.4 * severity:
-            contrast = random.uniform(0.7, 1.3)
+        if random.random() < 0.3 + 0.3 * severity:
+            contrast = random.uniform(0.75, 1.25)
             x = torch.clamp(TF.adjust_contrast(x, contrast), 0.0, 1.0)
 
-        if random.random() < 0.3 + 0.4 * severity:
-            gamma = random.uniform(0.8, 1.3)
+        if random.random() < 0.3 + 0.3 * severity:
+            gamma = random.uniform(0.85, 1.2)
             x = torch.clamp(TF.adjust_gamma(x, gamma), 0.0, 1.0)
 
         if random.random() < 0.25 + 0.4 * severity:
@@ -622,7 +623,7 @@ class DifferentiableAttack(nn.Module):
 
         # light gaussian noise
         if random.random() < 0.6 + 0.3 * severity:
-            noise_level = 0.01 + 0.03 * severity
+            noise_level = 0.008 + 0.025 * severity
             x = torch.clamp(x + torch.randn_like(x) * noise_level, 0, 1)
 
         return x
@@ -811,8 +812,9 @@ def train_residual_encoder(
     warmup_epochs = max(2, epochs // 5)      # e.g., 2 for 10 epochs
     # Residual penalty ramp: start light, end around 0.025
     def residual_weight(e):
-        return 0.005 + 0.02 * min(1.0, e / max(1, epochs - 1))
+        return 0.005 + 0.015 * min(1.0, e / max(1, epochs - 1))
 
+    last_epoch_ema = None
     for epoch in range(1, epochs + 1):
         enc.train(); dec.train()
         pbar = tqdm(dl, desc=f"Epoch {epoch}/{epochs}")
@@ -820,6 +822,10 @@ def train_residual_encoder(
         curriculum_progress = 0.0
         if curriculum and epoch > warmup_epochs:
             curriculum_progress = min(1.0, (epoch - warmup_epochs) / max(1, epochs - warmup_epochs))
+        severity_dampen = 1.0
+        if last_epoch_ema is not None and ema_acc < last_epoch_ema - 0.05:
+            severity_dampen = 0.7
+        adjusted_progress = curriculum_progress * severity_dampen
 
         for imgs in pbar:
             imgs = imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -840,12 +846,13 @@ def train_residual_encoder(
                 if epoch <= warmup_epochs or not curriculum:
                     attacked = watermarked_clamped
                 else:
-                    attacked = attack(watermarked_clamped, severity=curriculum_progress)
-                    if random.random() < 0.6 + 0.3 * curriculum_progress:
-                        noise_mag = 0.008 + 0.04 * curriculum_progress
+                    attack_strength = min(adjusted_progress, 0.6)
+                    attacked = attack(watermarked_clamped, severity=attack_strength)
+                    if random.random() < 0.6 + 0.25 * attack_strength:
+                        noise_mag = 0.006 + 0.03 * attack_strength
                         attacked = torch.clamp(attacked + torch.randn_like(attacked) * noise_mag, 0, 1)
-                    if curriculum_progress > 0.4 and random.random() < 0.2 + 0.3 * (curriculum_progress - 0.4):
-                        sigma = random.uniform(0.4, 1.4) * (1.0 + curriculum_progress)
+                    if attack_strength > 0.35 and random.random() < 0.15 + 0.35 * max(0.0, attack_strength - 0.35):
+                        sigma = random.uniform(0.35, 1.1) * (1.0 + 0.5 * attack_strength)
                         attacked = TF.gaussian_blur(attacked, kernel_size=5, sigma=sigma)
 
                 logits_att = dec(attacked)
@@ -884,6 +891,7 @@ def train_residual_encoder(
         if ema_acc > best_ema:
             best_ema = ema_acc
             torch.save({"enc": enc.state_dict(), "dec": dec.state_dict(), "payload_len": payload_len}, save_path)
+        last_epoch_ema = ema_acc
 
     torch.save({"enc": enc.state_dict(), "dec": dec.state_dict(), "payload_len": payload_len}, save_path)
     print(f"✅ Done. Best EMA BitAcc: {best_ema*100:.2f}% | Saved: {save_path}")
