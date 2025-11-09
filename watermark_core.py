@@ -520,6 +520,8 @@ class Encoder(nn.Module):
         p = self.pool(d1)
         d2 = self.down2(p)
         u = self.up1(d2)
+        if u.shape[-2:] != d1.shape[-2:]:
+            u = F.interpolate(u, size=d1.shape[-2:], mode="bilinear", align_corners=False)
         fused = torch.cat([u, d1], dim=1)
         r = self.fuse(fused)
         res = torch.tanh(self.out_conv(r)) * 0.2
