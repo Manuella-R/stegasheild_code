@@ -8,19 +8,22 @@ import pandas as pd
 from pathlib import Path
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 from PIL import Image
 import numpy as np
 import timm
 from sklearn.metrics import classification_report, accuracy_score
 from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
 
 class StegaDataset(Dataset):
-    def __init__(self, metadata_csv, transform=None, use_aux=True):
+    def __init__(self, metadata_csv, transform=None, use_aux=True, split=None):
         self.df = pd.read_csv(metadata_csv).fillna(0) # Fill NaNs with 0
         self.transform = transform
         self.use_aux = use_aux
+        if split is not None:
+            self.df = self.df[self.df['dataset_split'] == split]
         
         # Define the path to use based on the class label
         def get_path(row):
@@ -35,16 +38,24 @@ class StegaDataset(Dataset):
         self.df['image_path'] = self.df.apply(get_path, axis=1)
         # Filter out rows where the image path is missing
         self.df = self.df[self.df['image_path'].apply(lambda x: isinstance(x, str) and len(x) > 0 and Path(x).exists())]
+        # Reset index so DataLoader indices are dense [0, N)
+        self.df = self.df.reset_index(drop=True)
         
         self.labels = self.df['class_label'].astype(int).values
         self.image_paths = self.df['image_path'].values
         
         # Prepare auxiliary features
-        self.aux_features = self.df[['payload_ber', 'robust_conf', 'fragile_conf']].astype(np.float32).values
+        aux_cols = ['payload_ber', 'robust_conf', 'fragile_conf']
+        if self.use_aux:
+            self.aux_features = self.df[aux_cols].astype(np.float32).values
+        else:
+            # still keep placeholder zeros so dataloader returns consistent tuple
+            self.aux_features = np.zeros((len(self.df), len(aux_cols)), dtype=np.float32)
         # Normalize aux features (simple scaling)
         self.aux_features[:, 0] = self.aux_features[:, 0] * 2.0 - 1.0 # BER [0,1] -> [-1, 1]
         self.aux_features[:, 1] = self.aux_features[:, 1] * 2.0 - 1.0 # Conf [0,1] -> [-1, 1]
         self.aux_features[:, 2] = self.aux_features[:, 2] * 2.0 - 1.0 # Conf [0,1] -> [-1, 1]
+        self.aux_features = torch.from_numpy(self.aux_features)
 
         print(f"Loaded {len(self.df)} valid samples from {metadata_csv}")
 
@@ -61,12 +72,10 @@ class StegaDataset(Dataset):
             print(f"Warning: Failed to load {img_path}, returning dummy data. Error: {e}")
             img = torch.zeros(3, 299, 299) # Dummy image
             
-        label = self.labels[idx]
+        label = int(self.labels[idx])
         aux = self.aux_features[idx]
         
-        if self.use_aux:
-            return img, aux, label
-        return img, label
+        return img, aux, label
 
 class HybridXceptionModel(nn.Module):
     def __init__(self, num_classes=3, num_aux_features=3):
@@ -111,26 +120,52 @@ def build_model(num_classes=3, use_aux=True, num_aux_features=3):
     return model
 
 def train(metadata_csv, epochs=10, batch_size=16, lr=1e-4, use_aux=True):
-    transform = transforms.Compose([
-        transforms.Resize((299, 299)), # Xception input size
+    train_transform = transforms.Compose([
+        transforms.Resize((320, 320)),
+        transforms.RandomResizedCrop((299, 299), scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.05),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     
-    full_ds = StegaDataset(metadata_csv, transform=transform, use_aux=use_aux)
+    eval_transform = transforms.Compose([
+        transforms.Resize((320, 320)),
+        transforms.CenterCrop((299, 299)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
     
-    # Use the splits from the CSV file
-    train_df = full_ds.df[full_ds.df['dataset_split'] == 'train']
-    val_df = full_ds.df[full_ds.df['dataset_split'] == 'val']
+    train_ds = StegaDataset(metadata_csv, transform=train_transform, use_aux=use_aux, split='train')
+    val_ds = StegaDataset(metadata_csv, transform=eval_transform, use_aux=use_aux, split='val')
     
-    train_idx = train_df.index.values
-    val_idx = val_df.index.values
+    if len(train_ds) == 0:
+        raise ValueError(f"No training samples found in metadata CSV: {metadata_csv}")
+    
+    print(f"Training with {len(train_ds)} samples, Validating with {len(val_ds)} samples.")
+    
+    # Balance classes with weighted sampling
+    train_labels = train_ds.labels
+    class_sample_count = np.bincount(train_labels, minlength=3)
+    class_weights = 1.0 / np.clip(class_sample_count, a_min=1, a_max=None)
+    sample_weights = class_weights[train_labels]
+    train_sampler = WeightedRandomSampler(weights=torch.from_numpy(sample_weights).double(), num_samples=len(sample_weights), replacement=True)
 
-    from torch.utils.data import Subset
-    train_loader = DataLoader(Subset(full_ds, train_idx), batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(Subset(full_ds, val_idx), batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    num_workers = min(8, os.cpu_count() or 0)
+    loader_common_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    if num_workers > 0:
+        loader_common_kwargs.update(dict(persistent_workers=True, prefetch_factor=2))
+    else:
+        loader_common_kwargs.update(dict(persistent_workers=False))
     
-    print(f"Training with {len(train_idx)} samples, Validating with {len(val_idx)} samples.")
+    train_loader = DataLoader(train_ds, sampler=train_sampler, shuffle=False, **loader_common_kwargs)
+    
+    has_val = len(val_ds) > 0
+    if has_val:
+        val_loader = DataLoader(val_ds, shuffle=False, **loader_common_kwargs)
+    else:
+        val_loader = None
+        print("Warning: no validation samples found; validation metrics will be skipped.")
 
     model = build_model(num_classes=3, use_aux=use_aux, num_aux_features=3)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -139,6 +174,7 @@ def train(metadata_csv, epochs=10, batch_size=16, lr=1e-4, use_aux=True):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
+    scaler = GradScaler(enabled=(device.type == 'cuda'))
 
     best_val_acc = 0.0
     
@@ -150,20 +186,22 @@ def train(metadata_csv, epochs=10, batch_size=16, lr=1e-4, use_aux=True):
         
         for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs} [Train]'):
             inputs, auxs, labels = batch
-            inputs = inputs.to(device)
-            auxs = auxs.to(device)
-            labels = labels.to(device)
+            inputs = inputs.to(device, non_blocking=True)
+            auxs = auxs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
-            if use_aux:
-                logits = model(inputs, auxs)
-            else:
-                logits = model(inputs)
-                
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
+            with autocast(enabled=(device.type == 'cuda')):
+                if use_aux:
+                    logits = model(inputs, auxs)
+                else:
+                    logits = model(inputs)
+                loss = criterion(logits, labels)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             total_loss += loss.item()
             preds = logits.argmax(dim=1)
@@ -175,42 +213,46 @@ def train(metadata_csv, epochs=10, batch_size=16, lr=1e-4, use_aux=True):
         
         print(f"Epoch {epoch+1}/{epochs} - train_loss={train_loss:.4f} train_acc={train_acc:.4f}")
         
-        model.eval()
-        total_val_loss = 0
-        all_preds_val = []
-        all_labels_val = []
-        
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f'Epoch {epoch+1}/{epochs} [Val]'):
-                inputs, auxs, labels = batch
-                inputs = inputs.to(device)
-                auxs = auxs.to(device)
-                labels = labels.to(device)
-                
-                if use_aux:
-                    logits = model(inputs, auxs)
-                else:
-                    logits = model(inputs)
+        if has_val:
+            model.eval()
+            total_val_loss = 0
+            all_preds_val = []
+            all_labels_val = []
+            
+            with torch.no_grad():
+                for batch in tqdm(val_loader, desc=f'Epoch {epoch+1}/{epochs} [Val]'):
+                    inputs, auxs, labels = batch
+                    inputs = inputs.to(device, non_blocking=True)
+                    auxs = auxs.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
                     
-                loss = criterion(logits, labels)
-                total_val_loss += loss.item()
-                preds = logits.argmax(dim=1)
-                all_preds_val.extend(preds.cpu().numpy())
-                all_labels_val.extend(labels.cpu().numpy())
-        
-        val_acc = accuracy_score(all_labels_val, all_preds_val)
-        val_loss = total_val_loss / len(val_loader)
-        scheduler.step(val_loss)
+                    with autocast(enabled=(device.type == 'cuda')):
+                        if use_aux:
+                            logits = model(inputs, auxs)
+                        else:
+                            logits = model(inputs)
+                        loss = criterion(logits, labels)
+                    
+                    total_val_loss += loss.item()
+                    preds = logits.argmax(dim=1)
+                    all_preds_val.extend(preds.cpu().numpy())
+                    all_labels_val.extend(labels.cpu().numpy())
+            
+            val_acc = accuracy_score(all_labels_val, all_preds_val) if len(all_labels_val) else 0.0
+            val_loss = total_val_loss / max(1, len(val_loader))
+            scheduler.step(val_loss)
 
-        print(f"Epoch {epoch+1}/{epochs} - val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
-        
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), 'stegashield_cnn_final.pth')
-            print(f'New best model saved with val_acc: {best_val_acc:.4f}')
+            print(f"Epoch {epoch+1}/{epochs} - val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+            
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), 'stegashield_cnn_final.pth')
+                print(f'New best model saved with val_acc: {best_val_acc:.4f}')
 
-        print("\nValidation Classification Report:")
-        print(classification_report(all_labels_val, all_preds_val, target_names=['Original', 'Watermarked', 'Tampered'], zero_division=0))
+            print("\nValidation Classification Report:")
+            print(classification_report(all_labels_val, all_preds_val, target_names=['Original', 'Watermarked', 'Tampered'], zero_division=0))
+        else:
+            scheduler.step(train_loss)
 
     print('Training complete. Best model saved to stegashield_cnn_final.pth')
 
