@@ -765,6 +765,9 @@ def train_residual_encoder(
     save_path: str = "best_residual_hybrid.pt",
     curriculum: bool = True,
     cache_to_ram: bool = False,
+    max_attack_strength: float = 0.45,
+    amp: bool = True,
+    resume_from: str = None,
 ):
     """
     Fast training:
@@ -774,6 +777,9 @@ def train_residual_encoder(
       - Tuned DataLoader (num_workers, pin_memory, persistent_workers, prefetch_factor)
       - Optional RAM cache for the dataset
       - BCEWithLogitsLoss + residual L2 regularization
+      - Adjustable attack curriculum (max_attack_strength) with stability guards
+      - Optional AMP mixed precision (disable via amp=False)
+      - Resume support via saved checkpoint (resume_from/save_path)
     """
     # ---- Data
     ds = SimpleImageFolder(root_images, image_size=256, cache_to_ram=cache_to_ram, augment=True)
@@ -795,18 +801,60 @@ def train_residual_encoder(
     attack = DifferentiableAttack().to(device)
 
     # ---- Optim / Scheduler / AMP (new API + stronger LR, no weight decay)
+    amp_enabled = bool(amp and device == "cuda")
+
     opt = torch.optim.AdamW(
         list(enc.parameters()) + list(dec.parameters()),
-        lr=3e-4,              # was 1e-4
+        lr=lr,
         weight_decay=0.0      # explicitly no WD
     )
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1), eta_min=1e-5)
-    scaler = torch.amp.GradScaler('cuda', enabled=(device == "cuda"))
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
 
     best_ema = 0.0
     ema_acc = 0.0
     alpha = 0.2
     residual_ema = 0.0
+    attack_limit = float(max(0.25, min(0.9, max_attack_strength)))
+    attack_limit_init = attack_limit
+
+    start_epoch = 0
+    resume_path = None
+    auto_resume = resume_from is None
+    if resume_from:
+        rp = Path(resume_from)
+        if rp.exists():
+            resume_path = rp
+        else:
+            print(f"⚠️ Resume path not found: {resume_from}")
+    if auto_resume and resume_path is None:
+        sp = Path(save_path)
+        if sp.exists():
+            resume_path = sp
+            print(f"ℹ️ Auto-resuming from existing checkpoint at {save_path}")
+
+    if resume_path and resume_path.exists():
+        try:
+            ckpt = torch.load(resume_path, map_location=device)
+            enc.load_state_dict(ckpt["enc"])
+            dec.load_state_dict(ckpt["dec"])
+            best_ema = float(ckpt.get("best_ema", best_ema))
+            ema_acc = float(ckpt.get("ema_acc", ema_acc))
+            residual_ema = float(ckpt.get("residual_ema", residual_ema))
+            attack_limit = float(min(max_attack_strength, ckpt.get("attack_limit", attack_limit)))
+            start_epoch = int(ckpt.get("epoch", 0))
+            print(f"🔁 Resumed from {resume_path} @ epoch {start_epoch} | best_ema={best_ema*100:.2f}% atk_cap={attack_limit:.2f}")
+        except Exception as e:
+            print(f"⚠️ Failed to resume from {resume_path}: {e}")
+            start_epoch = 0
+            attack_limit = attack_limit_init
+
+    if start_epoch >= epochs:
+        print(f"✅ Already trained for {start_epoch} epochs (>= {epochs}). Nothing to do.")
+        return
+
+    for _ in range(start_epoch):
+        sched.step()
 
     # Warm-up: no attacks for first few epochs
     warmup_epochs = max(2, epochs // 5)      # e.g., 2 for 10 epochs
@@ -814,8 +862,8 @@ def train_residual_encoder(
     def residual_weight(e):
         return 0.005 + 0.015 * min(1.0, e / max(1, epochs - 1))
 
-    last_epoch_ema = None
-    for epoch in range(1, epochs + 1):
+    last_epoch_ema = ema_acc if start_epoch > 0 else None
+    for epoch in range(start_epoch + 1, epochs + 1):
         enc.train(); dec.train()
         pbar = tqdm(dl, desc=f"Epoch {epoch}/{epochs}")
 
@@ -832,7 +880,8 @@ def train_residual_encoder(
             B = imgs.size(0)
             target_bits = torch.randint(0, 2, (B, payload_len), device=device, dtype=torch.float32)
 
-            with torch.amp.autocast('cuda', enabled=(device == "cuda")):
+            attack_strength = 0.0
+            with torch.amp.autocast('cuda', enabled=amp_enabled):
                 # Encode residual & compose watermarked
                 residual = enc(imgs, target_bits)
                 watermarked = imgs + residual                      # keep linear path for grads
@@ -846,7 +895,7 @@ def train_residual_encoder(
                 if epoch <= warmup_epochs or not curriculum:
                     attacked = watermarked_clamped
                 else:
-                    attack_strength = min(adjusted_progress, 0.6)
+                    attack_strength = min(adjusted_progress, attack_limit)
                     attacked = attack(watermarked_clamped, severity=attack_strength)
                     if random.random() < 0.6 + 0.25 * attack_strength:
                         noise_mag = 0.006 + 0.03 * attack_strength
@@ -864,6 +913,13 @@ def train_residual_encoder(
 
                 # Total loss: attacked + half clean + residual penalty
                 loss = bce_att + 0.5 * bce_clean + lam * res_l2
+
+            if not torch.isfinite(loss):
+                print(f"⚠️ Non-finite loss encountered at epoch {epoch} (attack_cap={attack_limit:.2f}). Reducing attack intensity.")
+                attack_limit = max(0.25, attack_limit * 0.7)
+                opt.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -884,16 +940,44 @@ def train_residual_encoder(
                 bitAcc=f"{bit_acc*100:.1f}%",
                 EMA=f"{ema_acc*100:.1f}%",
                 lam=f"{lam:.3f}",
-                res=f"{residual_ema:.4f}"
+                res=f"{residual_ema:.4f}",
+                atk=f"{attack_strength:.2f}",
+                atkCap=f"{attack_limit:.2f}"
             )
+
+        if ema_acc < 0.55 and attack_limit > 0.3:
+            attack_limit = max(0.3, attack_limit * 0.9)
+        if residual_ema > 0.14 and attack_limit > 0.28:
+            attack_limit = max(0.28, attack_limit * 0.9)
+        if last_epoch_ema is not None and ema_acc > last_epoch_ema + 0.01 and residual_ema < 0.11:
+            attack_limit = min(max_attack_strength, attack_limit + 0.02)
+        attack_limit = float(max(0.25, min(max_attack_strength, attack_limit)))
 
         sched.step()
         if ema_acc > best_ema:
             best_ema = ema_acc
-            torch.save({"enc": enc.state_dict(), "dec": dec.state_dict(), "payload_len": payload_len}, save_path)
+            torch.save({
+                "enc": enc.state_dict(),
+                "dec": dec.state_dict(),
+                "payload_len": payload_len,
+                "best_ema": best_ema,
+                "ema_acc": ema_acc,
+                "attack_limit": attack_limit,
+                "residual_ema": residual_ema,
+                "epoch": epoch,
+            }, save_path)
         last_epoch_ema = ema_acc
 
-    torch.save({"enc": enc.state_dict(), "dec": dec.state_dict(), "payload_len": payload_len}, save_path)
+    torch.save({
+        "enc": enc.state_dict(),
+        "dec": dec.state_dict(),
+        "payload_len": payload_len,
+        "best_ema": best_ema,
+        "ema_acc": ema_acc,
+        "attack_limit": attack_limit,
+        "residual_ema": residual_ema,
+        "epoch": epochs,
+    }, save_path)
     print(f"✅ Done. Best EMA BitAcc: {best_ema*100:.2f}% | Saved: {save_path}")
 
 # =========================
