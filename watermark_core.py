@@ -910,10 +910,8 @@ def train_residual_encoder(
             target_bits = torch.randint(0, 2, (B, payload_len), device=device, dtype=torch.float32)
 
             attack_strength = 0.0
-            # Disable AMP during attack phase for better numerical stability
-            use_amp = amp_enabled and (epoch <= warmup_epochs or not attack_enabled)
-            
-            with torch.amp.autocast('cuda', enabled=use_amp):
+            # Keep AMP enabled for speed, but with careful numerical checks
+            with torch.amp.autocast('cuda', enabled=amp_enabled):
                 # Encode residual & compose watermarked
                 residual = enc(imgs, target_bits)
                 
@@ -941,13 +939,13 @@ def train_residual_encoder(
                     attacked = watermarked_clamped
                     attack_weight = 0.5  # reduce importance during warmup
                 else:
-                    # MUCH weaker initial attacks - start at 0.001 instead of 0.06
-                    # Use cubic root for even slower progression
-                    attack_strength = min(adjusted_progress ** 1.5 * 0.3, attack_limit)
-                    attack_weight = 0.7 + 0.3 * min(1.0, attack_strength / 0.15)
+                    # Balanced attack progression - not too slow, not too fast
+                    # Start at ~0.003, gradually increase
+                    attack_strength = min(adjusted_progress ** 1.2 * 0.4, attack_limit)
+                    attack_weight = 0.75 + 0.25 * min(1.0, attack_strength / 0.2)
                     
-                    # Only apply attacks if strength is meaningful and with lower probability
-                    if attack_strength > 0.005 and random.random() < 0.3 + 0.2 * attack_strength:
+                    # Apply attacks with moderate probability
+                    if attack_strength > 0.003 and random.random() < 0.4 + 0.25 * attack_strength:
                         try:
                             attacked = attack(watermarked_clamped, severity=attack_strength)
                             # Validate attack output
@@ -960,14 +958,14 @@ def train_residual_encoder(
                     else:
                         attacked = watermarked_clamped
                     
-                    # Much lighter noise
-                    if attack_strength > 0.01 and random.random() < 0.25 + 0.15 * attack_strength:
-                        noise_mag = 0.002 + 0.008 * attack_strength
+                    # Moderate noise application
+                    if attack_strength > 0.008 and random.random() < 0.3 + 0.2 * attack_strength:
+                        noise_mag = 0.003 + 0.012 * attack_strength
                         attacked = torch.clamp(attacked + torch.randn_like(attacked) * noise_mag, 0, 1)
                     
-                    # Only blur at much higher strengths
-                    if attack_strength > 0.35 and random.random() < 0.05 + 0.15 * max(0.0, attack_strength - 0.35):
-                        sigma = random.uniform(0.2, 0.6) * (1.0 + 0.2 * attack_strength)
+                    # Blur at moderate strengths
+                    if attack_strength > 0.2 and random.random() < 0.08 + 0.2 * max(0.0, attack_strength - 0.2):
+                        sigma = random.uniform(0.3, 0.7) * (1.0 + 0.25 * attack_strength)
                         attacked = TF.gaussian_blur(attacked, kernel_size=3, sigma=sigma)
 
                 logits_att = dec(attacked)
@@ -1000,9 +998,9 @@ def train_residual_encoder(
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             
-            # Aggressive gradient clipping before unscaling
+            # Moderate gradient clipping before unscaling
             scaler.unscale_(opt)
-            grad_norm = torch.nn.utils.clip_grad_norm_(list(enc.parameters()) + list(dec.parameters()), max_norm=0.5)
+            grad_norm = torch.nn.utils.clip_grad_norm_(list(enc.parameters()) + list(dec.parameters()), max_norm=1.0)
             
             # Check if gradients are finite after clipping
             if not torch.isfinite(grad_norm):
@@ -1038,29 +1036,31 @@ def train_residual_encoder(
             if failure_rate > 0.1:  # More than 10% failures
                 print(f"⚠️ Non-finite loss rate: {failure_rate*100:.1f}% ({nonfinite_count_epoch}/{total_batches_epoch} batches)")
         
-        # Dynamic attack cap adjustment - very conservative
-        if ema_acc < 0.62 and attack_limit > 0.15:
-            attack_limit = max(0.15, attack_limit * 0.80)
+        # Dynamic attack cap adjustment - balanced approach
+        # Reduce if accuracy is poor
+        if ema_acc < 0.58 and attack_limit > 0.15:
+            attack_limit = max(0.15, attack_limit * 0.85)
             print(f"📉 Accuracy low ({ema_acc*100:.1f}%), reducing attack_cap to {attack_limit:.2f}")
         
-        if residual_ema > 0.12 and attack_limit > 0.15:
-            attack_limit = max(0.15, attack_limit * 0.85)
+        # Reduce if residual is too high
+        if residual_ema > 0.14 and attack_limit > 0.15:
+            attack_limit = max(0.15, attack_limit * 0.90)
             print(f"📊 High residual ({residual_ema:.4f}), reducing attack_cap to {attack_limit:.2f}")
         
-        # Reduce if too many non-finite losses
-        if nonfinite_count_epoch > len(dl) * 0.1:  # >10% failures
-            attack_limit = max(0.10, attack_limit * 0.5)
-            print(f"🔥 High failure rate, aggressively reducing attack_cap to {attack_limit:.2f}")
+        # Aggressively reduce if high failure rate
+        if nonfinite_count_epoch > len(dl) * 0.05:  # >5% failures
+            attack_limit = max(0.12, attack_limit * 0.6)
+            print(f"🔥 High failure rate, reducing attack_cap to {attack_limit:.2f}")
         
-        # Only increase attack if ALL metrics are excellent
+        # Increase attack if metrics are good (more relaxed conditions)
         if (last_epoch_ema is not None and 
-            ema_acc > max(0.68, last_epoch_ema + 0.03) and 
-            residual_ema < 0.09 and 
-            nonfinite_count_epoch < len(dl) * 0.01):  # <1% failures
-            attack_limit = min(max_attack_strength, attack_limit + 0.01)
-            print(f"📈 Excellent progress, carefully increasing attack_cap to {attack_limit:.2f}")
+            ema_acc > max(0.64, last_epoch_ema) and  # Stable or improving
+            residual_ema < 0.11 and 
+            nonfinite_count_epoch < len(dl) * 0.02):  # <2% failures
+            attack_limit = min(max_attack_strength, attack_limit + 0.02)
+            print(f"📈 Good progress, increasing attack_cap to {attack_limit:.2f}")
         
-        attack_limit = float(max(0.10, min(max_attack_strength, attack_limit)))
+        attack_limit = float(max(0.12, min(max_attack_strength, attack_limit)))
 
         sched.step()
         if ema_acc > best_ema:
