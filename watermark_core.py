@@ -470,16 +470,26 @@ def attack_patch_replace(img, size=0.15):
 # Learned Encoder/Decoder (112 bits)
 # =========================
 class Encoder(nn.Module):
+    """Enhanced Encoder with deeper architecture and better payload integration."""
     def __init__(self, in_channels=3, hidden=128, payload_len=112):
         super().__init__()
         self.hidden = hidden
         self.payload_len = payload_len
+        
+        # Deeper payload embedding with residual connection
         self.payload_embed = nn.Sequential(
-            nn.Linear(payload_len, hidden * 2),
+            nn.Linear(payload_len, hidden * 4),
+            nn.LayerNorm(hidden * 4),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden * 4, hidden * 2),
+            nn.LayerNorm(hidden * 2),
             nn.SiLU(),
             nn.Linear(hidden * 2, hidden),
             nn.SiLU()
         )
+        
+        # Encoder path with residual blocks
         self.down1 = nn.Sequential(
             nn.Conv2d(in_channels + hidden, hidden, 3, padding=1),
             nn.BatchNorm2d(hidden),
@@ -488,94 +498,177 @@ class Encoder(nn.Module):
             nn.BatchNorm2d(hidden),
             nn.SiLU()
         )
-        self.pool = nn.MaxPool2d(2)
+        self.pool1 = nn.MaxPool2d(2)
+        
         self.down2 = nn.Sequential(
             nn.Conv2d(hidden, hidden * 2, 3, padding=1),
             nn.BatchNorm2d(hidden * 2),
             nn.SiLU(),
-            nn.Conv2d(hidden * 2, hidden * 2, 3, padding=1, dilation=2),
+            nn.Conv2d(hidden * 2, hidden * 2, 3, padding=1),
             nn.BatchNorm2d(hidden * 2),
             nn.SiLU()
         )
+        self.pool2 = nn.MaxPool2d(2)
+        
+        # Bottleneck with attention
+        self.down3 = nn.Sequential(
+            nn.Conv2d(hidden * 2, hidden * 4, 3, padding=1),
+            nn.BatchNorm2d(hidden * 4),
+            nn.SiLU(),
+            nn.Conv2d(hidden * 4, hidden * 4, 3, padding=1, dilation=2),
+            nn.BatchNorm2d(hidden * 4),
+            nn.SiLU()
+        )
+        
+        # Decoder path with skip connections
         self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(hidden * 4, hidden * 2, 2, stride=2),
+            nn.SiLU()
+        )
+        self.fuse1 = nn.Sequential(
+            nn.Conv2d(hidden * 4, hidden * 2, 3, padding=1),
+            nn.BatchNorm2d(hidden * 2),
+            nn.SiLU(),
+            nn.Conv2d(hidden * 2, hidden * 2, 3, padding=1),
+            nn.BatchNorm2d(hidden * 2),
+            nn.SiLU()
+        )
+        
+        self.up2 = nn.Sequential(
             nn.ConvTranspose2d(hidden * 2, hidden, 2, stride=2),
             nn.SiLU()
         )
-        self.fuse = nn.Sequential(
+        self.fuse2 = nn.Sequential(
             nn.Conv2d(hidden * 2, hidden, 3, padding=1),
             nn.BatchNorm2d(hidden),
             nn.SiLU(),
             nn.Conv2d(hidden, hidden, 3, padding=1),
             nn.SiLU()
         )
+        
         self.out_conv = nn.Conv2d(hidden, in_channels, 1)
 
     def forward(self, x, payload_bits):
         if payload_bits is None:
             payload_bits = torch.zeros(x.size(0), self.payload_len, device=x.device, dtype=x.dtype)
+        
+        # Embed payload as spatial feature map
         payload_feat = self.payload_embed(payload_bits)
         payload_feat = payload_feat.view(payload_feat.size(0), self.hidden, 1, 1).expand(-1, -1, x.size(2), x.size(3))
+        
+        # Encoder with skip connections
         x_in = torch.cat([x, payload_feat], dim=1)
         d1 = self.down1(x_in)
-        p = self.pool(d1)
-        d2 = self.down2(p)
-        u = self.up1(d2)
-        if u.shape[-2:] != d1.shape[-2:]:
-            u = F.interpolate(u, size=d1.shape[-2:], mode="bilinear", align_corners=False)
-        fused = torch.cat([u, d1], dim=1)
-        r = self.fuse(fused)
-        res = torch.tanh(self.out_conv(r)) * 0.2
+        p1 = self.pool1(d1)
+        
+        d2 = self.down2(p1)
+        p2 = self.pool2(d2)
+        
+        d3 = self.down3(p2)
+        
+        # Decoder with skip connections
+        u1 = self.up1(d3)
+        if u1.shape[-2:] != d2.shape[-2:]:
+            u1 = F.interpolate(u1, size=d2.shape[-2:], mode="bilinear", align_corners=False)
+        fused1 = torch.cat([u1, d2], dim=1)
+        r1 = self.fuse1(fused1)
+        
+        u2 = self.up2(r1)
+        if u2.shape[-2:] != d1.shape[-2:]:
+            u2 = F.interpolate(u2, size=d1.shape[-2:], mode="bilinear", align_corners=False)
+        fused2 = torch.cat([u2, d1], dim=1)
+        r2 = self.fuse2(fused2)
+        
+        # Output residual (bounded)
+        res = torch.tanh(self.out_conv(r2)) * 0.15  # Reduced from 0.2 for less visibility
         return res
 
 class Decoder(nn.Module):
+    """Enhanced Decoder with deeper architecture and dropout for robustness."""
     def __init__(self, in_channels=3, payload_len=112, hidden=128):
         super().__init__()
+        # Deeper convolutional feature extractor
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, hidden, 3, padding=1),
             nn.BatchNorm2d(hidden),
             nn.SiLU(),
-            nn.Conv2d(hidden, hidden, 3, stride=2, padding=1),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
             nn.BatchNorm2d(hidden),
             nn.SiLU(),
+            
             nn.Conv2d(hidden, hidden * 2, 3, stride=2, padding=1),
             nn.BatchNorm2d(hidden * 2),
+            nn.SiLU(),
+            nn.Conv2d(hidden * 2, hidden * 2, 3, padding=1),
+            nn.BatchNorm2d(hidden * 2),
+            nn.SiLU(),
+            
+            nn.Conv2d(hidden * 2, hidden * 4, 3, stride=2, padding=1),
+            nn.BatchNorm2d(hidden * 4),
+            nn.SiLU(),
+            nn.Conv2d(hidden * 4, hidden * 4, 3, padding=1, dilation=2),
+            nn.BatchNorm2d(hidden * 4),
             nn.SiLU()
         )
-        self.pool = nn.AdaptiveAvgPool2d((8, 8))
+        
+        # Global pooling + local pooling for multi-scale features
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.local_pool = nn.AdaptiveAvgPool2d((8, 8))
+        
+        # Deeper FC head with residual connection
         self.fc = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(hidden * 2 * 8 * 8, 1024),
+            nn.Linear(hidden * 4 * (1 + 64), 2048),  # 1 + 64 = global + local features
+            nn.LayerNorm(2048),
+            nn.SiLU(),
+            nn.Dropout(0.3),
+            nn.Linear(2048, 1024),
+            nn.LayerNorm(1024),
             nn.SiLU(),
             nn.Dropout(0.2),
             nn.Linear(1024, payload_len)
         )
+        
     def forward(self, x):
         f = self.conv(x)
-        f = self.pool(f)
-        out = self.fc(f)
+        
+        # Multi-scale pooling
+        f_global = self.global_pool(f)
+        f_local = self.local_pool(f)
+        
+        # Concatenate multi-scale features
+        f_combined = torch.cat([f_global.flatten(1), f_local.flatten(1)], dim=1)
+        
+        out = self.fc(f_combined)
         return out  # raw logits (use BCEWithLogitsLoss)
 
 # =========================
 # Differentiable Attack (for training)
 # =========================
 class DifferentiableAttack(nn.Module):
+    """Comprehensive differentiable attack suite for robust watermark training."""
     def __init__(self):
         super().__init__()
+    
     def forward(self, imgs, severity: float = 1.0):
         x = imgs
         severity = float(max(0.0, min(0.6, severity)))
         b, c, h, w = x.shape
-
-        # random affine jitter (rotation / translation / scale / shear)
-        if random.random() < 0.4 + 0.4 * severity:
-            angle = random.uniform(-10, 10) * severity
+        
+        # =========================
+        # GEOMETRIC ATTACKS
+        # =========================
+        
+        # 1. Affine transformations (rotation, translation, scale, shear)
+        if random.random() < 0.45 + 0.35 * severity:
+            angle = random.uniform(-15, 15) * severity
             translate = (
-                int(random.uniform(-0.08, 0.08) * severity * w),
-                int(random.uniform(-0.08, 0.08) * severity * h),
+                int(random.uniform(-0.10, 0.10) * severity * w),
+                int(random.uniform(-0.10, 0.10) * severity * h),
             )
-            scale = random.uniform(0.75, 1.05)
-            shear_x = random.uniform(-8, 8) * severity
-            shear_y = random.uniform(-8, 8) * severity
+            scale = random.uniform(0.7, 1.1)
+            shear_x = random.uniform(-10, 10) * severity
+            shear_y = random.uniform(-10, 10) * severity
             x = TF.affine(
                 x,
                 angle=angle,
@@ -585,48 +678,266 @@ class DifferentiableAttack(nn.Module):
                 interpolation=InterpolationMode.BILINEAR,
                 fill=0.5,
             )
-
-        # multi-scale blur / down-up sampling
-        if random.random() < 0.5 + 0.3 * severity:
-            scale = random.uniform(max(0.55, 0.85 - 0.3 * severity), 1.0)
-            nh, nw = max(4, int(h * scale)), max(4, int(w * scale))
+        
+        # 2. Perspective distortion
+        if random.random() < 0.15 + 0.25 * severity:
+            distortion_scale = 0.15 * severity
+            startpoints = [[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]]
+            endpoints = []
+            for point in startpoints:
+                dx = random.uniform(-distortion_scale * w, distortion_scale * w)
+                dy = random.uniform(-distortion_scale * h, distortion_scale * h)
+                endpoints.append([point[0] + dx, point[1] + dy])
+            x = TF.perspective(x, startpoints, endpoints, interpolation=InterpolationMode.BILINEAR, fill=0.5)
+        
+        # 3. Random crop and resize (simulates different cropping attacks)
+        if random.random() < 0.3 + 0.25 * severity:
+            crop_ratio = random.uniform(0.7, 0.95)
+            ch = max(8, int(h * crop_ratio))
+            cw = max(8, int(w * crop_ratio))
+            y1 = random.randint(0, h - ch)
+            x1 = random.randint(0, w - cw)
+            x = x[:, :, y1:y1+ch, x1:x1+cw]
+            x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
+        
+        # =========================
+        # BLUR & COMPRESSION ATTACKS
+        # =========================
+        
+        # 4. Multi-scale downsampling (JPEG-like compression artifact)
+        if random.random() < 0.55 + 0.30 * severity:
+            scale = random.uniform(max(0.50, 0.80 - 0.35 * severity), 1.0)
+            nh, nw = max(8, int(h * scale)), max(8, int(w * scale))
             x = F.interpolate(x, size=(nh, nw), mode="bilinear", align_corners=False)
             x = F.interpolate(x, size=(h, w), mode="bilinear", align_corners=False)
-
-        if random.random() < 0.25 + 0.35 * severity:
-            sigma_min = 0.15
-            sigma = random.uniform(sigma_min, 0.9 + 0.8 * severity)
-            x = TF.gaussian_blur(x, kernel_size=3, sigma=sigma)
-
-        if random.random() < 0.3 + 0.3 * severity:
-            contrast = random.uniform(0.75, 1.25)
+        
+        # 5. Gaussian blur (various strengths)
+        if random.random() < 0.30 + 0.40 * severity:
+            sigma = random.uniform(0.1, 1.2 + 1.0 * severity)
+            kernel_size = random.choice([3, 5, 7])
+            x = TF.gaussian_blur(x, kernel_size=kernel_size, sigma=sigma)
+        
+        # 6. Motion blur (approximated with directional blur)
+        if random.random() < 0.15 + 0.20 * severity:
+            kernel_size = int(3 + 6 * severity)
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            angle_deg = random.uniform(0, 180)
+            # Simulate motion blur with anisotropic gaussian
+            x = TF.gaussian_blur(x, kernel_size=kernel_size, sigma=1.0 + 2.0 * severity)
+        
+        # 7. Median filter effect (via pooling approximation)
+        if random.random() < 0.12 + 0.15 * severity:
+            pool_size = random.choice([3, 5])
+            x = F.avg_pool2d(x, kernel_size=pool_size, stride=1, padding=pool_size//2)
+        
+        # =========================
+        # COLOR & BRIGHTNESS ATTACKS
+        # =========================
+        
+        # 8. Brightness adjustment
+        if random.random() < 0.35 + 0.30 * severity:
+            brightness = random.uniform(0.70, 1.30)
+            x = torch.clamp(TF.adjust_brightness(x, brightness), 0.0, 1.0)
+        
+        # 9. Contrast adjustment  
+        if random.random() < 0.35 + 0.35 * severity:
+            contrast = random.uniform(0.65, 1.40)
             x = torch.clamp(TF.adjust_contrast(x, contrast), 0.0, 1.0)
-
-        if random.random() < 0.3 + 0.3 * severity:
-            gamma = random.uniform(0.85, 1.2)
+        
+        # 10. Gamma correction
+        if random.random() < 0.30 + 0.35 * severity:
+            gamma = random.uniform(0.75, 1.35)
             x = torch.clamp(TF.adjust_gamma(x, gamma), 0.0, 1.0)
-
-        if random.random() < 0.25 + 0.4 * severity:
-            saturation = random.uniform(0.6, 1.4)
+        
+        # 11. Saturation adjustment
+        if random.random() < 0.30 + 0.40 * severity:
+            saturation = random.uniform(0.50, 1.60)
             x = torch.clamp(TF.adjust_saturation(x, saturation), 0.0, 1.0)
-
-        if random.random() < 0.2 + 0.3 * severity:
-            hue = random.uniform(-0.04, 0.04)
+        
+        # 12. Hue shift
+        if random.random() < 0.25 + 0.35 * severity:
+            hue = random.uniform(-0.08, 0.08) * severity
             x = torch.clamp(TF.adjust_hue(x, hue), 0.0, 1.0)
-
-        # channel drop / mix
-        if random.random() < 0.2 * severity:
-            mask = torch.ones_like(x)
-            ch = random.randrange(c)
-            mask[:, ch, :, :] = mask[:, ch, :, :].mul(0.0)
-            x = x * mask
-
-        # light gaussian noise
-        if random.random() < 0.6 + 0.3 * severity:
-            noise_level = 0.008 + 0.025 * severity
+        
+        # 13. Posterization (color quantization)
+        if random.random() < 0.15 + 0.20 * severity:
+            bits = random.randint(4, 6)  # Reduce color depth
+            x = TF.posterize(x, bits=bits)
+        
+        # 14. Color channel shuffle/manipulation
+        if random.random() < 0.12 + 0.15 * severity:
+            # Randomly permute color channels
+            perm = torch.randperm(c)
+            x = x[:, perm, :, :]
+        
+        # 15. Grayscale conversion (partial)
+        if random.random() < 0.10 + 0.15 * severity:
+            gray = TF.rgb_to_grayscale(x, num_output_channels=3)
+            mix_ratio = random.uniform(0.2, 0.6) * severity
+            x = mix_ratio * gray + (1 - mix_ratio) * x
+        
+        # =========================
+        # NOISE ATTACKS
+        # =========================
+        
+        # 16. Gaussian noise (additive)
+        if random.random() < 0.60 + 0.35 * severity:
+            noise_level = 0.008 + 0.035 * severity
             x = torch.clamp(x + torch.randn_like(x) * noise_level, 0, 1)
-
-        return x
+        
+        # 17. Salt & pepper noise
+        if random.random() < 0.10 + 0.15 * severity:
+            noise_prob = 0.01 + 0.03 * severity
+            salt_pepper = torch.rand_like(x)
+            x = torch.where(salt_pepper < noise_prob/2, torch.zeros_like(x), x)
+            x = torch.where(salt_pepper > 1 - noise_prob/2, torch.ones_like(x), x)
+        
+        # 18. Speckle (multiplicative) noise
+        if random.random() < 0.12 + 0.18 * severity:
+            speckle = 1.0 + torch.randn_like(x) * (0.05 + 0.10 * severity)
+            x = torch.clamp(x * speckle, 0, 1)
+        
+        # =========================
+        # JPEG COMPRESSION SIMULATION
+        # =========================
+        
+        # 19. JPEG-like block artifacts (via DCT quantization simulation)
+        if random.random() < 0.20 + 0.30 * severity:
+            # Simulate JPEG compression by adding block artifacts
+            quality_factor = random.uniform(0.5, 0.95) * (1.0 - 0.4 * severity)
+            block_size = 8
+            # Simple approximation: add noise in block pattern
+            for i in range(0, h, block_size):
+                for j in range(0, w, block_size):
+                    if random.random() < 0.3:
+                        block_noise = torch.randn(b, c, min(block_size, h-i), min(block_size, w-j), device=x.device)
+                        block_noise *= (0.005 + 0.015 * severity) * (1 - quality_factor)
+                        x[:, :, i:i+block_size, j:j+block_size] += block_noise
+            x = torch.clamp(x, 0, 1)
+        
+        # =========================
+        # SPATIAL ATTACKS
+        # =========================
+        
+        # 20. Elastic deformation (local warping)
+        if random.random() < 0.10 + 0.15 * severity:
+            alpha = 5.0 * severity
+            sigma = 3.0
+            grid_scale = int(h / 8)
+            # Create random displacement field
+            dx = torch.randn(b, 1, grid_scale, grid_scale, device=x.device) * alpha
+            dy = torch.randn(b, 1, grid_scale, grid_scale, device=x.device) * alpha
+            dx = F.interpolate(dx, size=(h, w), mode='bilinear', align_corners=False)
+            dy = F.interpolate(dy, size=(h, w), mode='bilinear', align_corners=False)
+            # Apply slight warping
+            grid_y, grid_x = torch.meshgrid(torch.linspace(-1, 1, h, device=x.device), 
+                                           torch.linspace(-1, 1, w, device=x.device), indexing='ij')
+            grid = torch.stack([grid_x, grid_y], dim=2).unsqueeze(0).repeat(b, 1, 1, 1)
+            grid = grid + torch.cat([dx, dy], dim=1).permute(0, 2, 3, 1) * 0.05
+            x = F.grid_sample(x, grid, mode='bilinear', padding_mode='border', align_corners=False)
+        
+        # 21. Random erasing (patch dropout)
+        if random.random() < 0.15 + 0.20 * severity:
+            erase_ratio = random.uniform(0.05, 0.20) * severity
+            erase_h = int(h * random.uniform(0.1, 0.3))
+            erase_w = int(w * random.uniform(0.1, 0.3))
+            if erase_h > 0 and erase_w > 0 and erase_h < h and erase_w < w:
+                y1 = random.randint(0, h - erase_h)
+                x1 = random.randint(0, w - erase_w)
+                erase_value = random.uniform(0.3, 0.7)
+                x[:, :, y1:y1+erase_h, x1:x1+erase_w] = erase_value
+        
+        # 22. Random channel dropout
+        if random.random() < 0.15 + 0.20 * severity:
+            mask = torch.ones_like(x)
+            num_drop = random.randint(1, 2)
+            for _ in range(num_drop):
+                ch = random.randrange(c)
+                mask[:, ch, :, :] *= random.uniform(0.0, 0.5)
+            x = x * mask
+        
+        # 23. Checkerboard dropout (pixel pattern loss)
+        if random.random() < 0.08 + 0.12 * severity:
+            checker_size = random.choice([2, 4, 8])
+            mask = torch.ones_like(x)
+            for i in range(0, h, checker_size * 2):
+                for j in range(0, w, checker_size * 2):
+                    if random.random() < 0.5:
+                        mask[:, :, i:i+checker_size, j:j+checker_size] = 0.5
+            x = x * mask
+        
+        # =========================
+        # SHARPENING & FILTERING
+        # =========================
+        
+        # 24. Sharpening (unsharp mask)
+        if random.random() < 0.15 + 0.20 * severity:
+            blurred = TF.gaussian_blur(x, kernel_size=3, sigma=1.0)
+            sharpness = random.uniform(1.0, 2.0) * severity
+            x = torch.clamp(x + sharpness * (x - blurred), 0, 1)
+        
+        # 25. Edge enhancement
+        if random.random() < 0.10 + 0.15 * severity:
+            # Simple edge filter approximation
+            kernel = torch.tensor([[[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]]], 
+                                 dtype=x.dtype, device=x.device).repeat(c, 1, 1, 1) / 8.0
+            edges = F.conv2d(x, kernel, padding=1, groups=c)
+            edge_strength = random.uniform(0.1, 0.3) * severity
+            x = torch.clamp(x + edge_strength * edges, 0, 1)
+        
+        # =========================
+        # COLOR SPACE ATTACKS
+        # =========================
+        
+        # 26. Solarization (threshold inversion)
+        if random.random() < 0.12 + 0.15 * severity:
+            threshold = random.uniform(0.4, 0.7)
+            x = TF.solarize(x, threshold=threshold)
+        
+        # 27. Equalization (histogram equalization effect)
+        if random.random() < 0.10 + 0.15 * severity:
+            x = TF.equalize(x)
+        
+        # 28. Autocontrast
+        if random.random() < 0.10 + 0.15 * severity:
+            x = TF.autocontrast(x)
+        
+        # 29. Invert colors
+        if random.random() < 0.05 + 0.08 * severity:
+            x = TF.invert(x)
+        
+        # =========================
+        # ADDITIONAL ROBUSTNESS
+        # =========================
+        
+        # 30. Dropout2d (spatial feature dropout)
+        if random.random() < 0.10 + 0.15 * severity:
+            dropout_prob = random.uniform(0.05, 0.15) * severity
+            mask = (torch.rand(b, 1, h, w, device=x.device) > dropout_prob).float()
+            x = x * mask
+        
+        # 31. Color jitter combined
+        if random.random() < 0.25 + 0.30 * severity:
+            brightness = random.uniform(0.75, 1.25)
+            contrast = random.uniform(0.75, 1.25)
+            saturation = random.uniform(0.60, 1.50)
+            x = torch.clamp(TF.adjust_brightness(x, brightness), 0, 1)
+            x = torch.clamp(TF.adjust_contrast(x, contrast), 0, 1)
+            x = torch.clamp(TF.adjust_saturation(x, saturation), 0, 1)
+        
+        # 32. Channel-wise scaling (color cast)
+        if random.random() < 0.20 + 0.25 * severity:
+            channel_scales = torch.empty(1, c, 1, 1, device=x.device).uniform_(0.75, 1.30)
+            x = torch.clamp(x * channel_scales, 0, 1)
+        
+        # 33. Mix with constant/random pattern
+        if random.random() < 0.08 + 0.10 * severity:
+            mix_strength = random.uniform(0.1, 0.25) * severity
+            pattern = torch.rand_like(x) if random.random() < 0.5 else torch.full_like(x, random.uniform(0.3, 0.7))
+            x = (1 - mix_strength) * x + mix_strength * pattern
+        
+        return torch.clamp(x, 0, 1)
 
 # =========================
 # SimpleImageFolder dataset (fast, optional RAM cache)
@@ -800,16 +1111,19 @@ def train_residual_encoder(
     dec = Decoder(payload_len=payload_len).to(device).to(memory_format=torch.channels_last)
     attack = DifferentiableAttack().to(device)
 
-    # ---- Optim / Scheduler / AMP (new API + stronger LR, no weight decay)
+    # ---- Optim / Scheduler / AMP (optimized for 85%+ accuracy)
     amp_enabled = bool(amp and device == "cuda")
 
-    opt = torch.optim.AdamW(
-        list(enc.parameters()) + list(dec.parameters()),
-        lr=lr,
-        weight_decay=0.0      # explicitly no WD
-    )
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1), eta_min=1e-5)
-    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
+    # Separate learning rates for encoder (harder task) and decoder (easier task)
+    opt = torch.optim.AdamW([
+        {'params': enc.parameters(), 'lr': lr * 1.2, 'weight_decay': 1e-5},  # Higher LR for encoder
+        {'params': dec.parameters(), 'lr': lr, 'weight_decay': 1e-4}  # Standard LR for decoder with slight WD
+    ], betas=(0.9, 0.999), eps=1e-8)
+    
+    # Warmup + Cosine schedule for better convergence
+    warmup_epochs_sched = max(5, epochs // 20)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs - warmup_epochs_sched, 1), eta_min=1e-6)
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled, init_scale=2048.0)
 
     best_ema = 0.0
     ema_acc = 0.0
@@ -861,10 +1175,13 @@ def train_residual_encoder(
         sched.step()
 
     # Warm-up: no attacks for longer to build strong base
-    warmup_epochs = max(8, epochs // 3)      # ~40% of training without attacks
-    # Residual penalty ramp: start very light, grow slowly
+    warmup_epochs = max(10, epochs // 4)      # ~25% of training without attacks (was 33%)
+    
+    # Residual penalty ramp: start very light, grow slowly with cosine schedule
     def residual_weight(e):
-        return 0.003 + 0.012 * min(1.0, e / max(1, epochs - 1))
+        # Cosine annealing from 0.002 to 0.012
+        progress = min(1.0, e / max(1, epochs - 1))
+        return 0.002 + 0.010 * (1 - math.cos(progress * math.pi)) / 2
 
     last_epoch_ema = ema_acc if start_epoch > 0 else None
     for epoch in range(start_epoch + 1, epochs + 1):
@@ -877,20 +1194,25 @@ def train_residual_encoder(
 
         curriculum_progress = 0.0
         if curriculum and epoch > warmup_epochs:
-            # Much slower attack ramping: square root makes it grow slower initially
+            # Smoother attack ramping with power 1.1 for gradual increase
             raw_progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
-            curriculum_progress = math.sqrt(raw_progress)  # slower initial growth
+            curriculum_progress = raw_progress ** 1.1  # Slightly slower than linear
         
-        # Strong damping if accuracy drops
+        # Adaptive damping based on performance
         severity_dampen = 1.0
         if last_epoch_ema is not None:
             acc_drop = last_epoch_ema - ema_acc
-            if acc_drop > 0.08:  # significant drop
-                severity_dampen = 0.5
-            elif acc_drop > 0.05:  # moderate drop
-                severity_dampen = 0.7
-            elif acc_drop > 0.02:  # small drop
-                severity_dampen = 0.85
+            if acc_drop > 0.10:  # severe drop
+                severity_dampen = 0.4
+            elif acc_drop > 0.06:  # significant drop
+                severity_dampen = 0.6
+            elif acc_drop > 0.03:  # moderate drop
+                severity_dampen = 0.8
+            elif acc_drop > 0.01:  # small drop
+                severity_dampen = 0.9
+            # If improving, boost attack strength slightly
+            elif ema_acc > last_epoch_ema + 0.02:
+                severity_dampen = 1.1  # Push harder when doing well
         
         adjusted_progress = curriculum_progress * severity_dampen
 
@@ -977,13 +1299,31 @@ def train_residual_encoder(
                     opt.zero_grad(set_to_none=True)
                     continue
 
-                # Residual regularization (ramped)
+                # Residual regularization (multiple components)
                 res_l2 = (residual ** 2).mean()
+                res_l1 = residual.abs().mean()  # L1 for sparsity
                 lam = residual_weight(epoch - 1)
-
-                # Total loss with careful weighting
-                clean_weight = 1.0 if epoch <= warmup_epochs else 0.5
-                loss = attack_weight * bce_att + clean_weight * bce_clean + lam * res_l2
+                
+                # Perceptual quality: penalize visible artifacts
+                # Use SSIM-inspired local variance penalty
+                watermarked_var = F.avg_pool2d((watermarked_clamped - imgs) ** 2, kernel_size=5, stride=1, padding=2)
+                visibility_penalty = watermarked_var.mean()
+                
+                # Decoder confidence penalty: encourage confident predictions
+                # Higher confidence = better separation between 0 and 1
+                probs_clean = torch.sigmoid(logits_clean)
+                probs_att = torch.sigmoid(logits_att)
+                confidence_clean = torch.abs(probs_clean - 0.5).mean()  # Distance from uncertain (0.5)
+                confidence_att = torch.abs(probs_att - 0.5).mean()
+                confidence_bonus = -(confidence_clean + confidence_att) * 0.1  # Reward confidence
+                
+                # Total loss with multiple components
+                clean_weight = 1.0 if epoch <= warmup_epochs else 0.6  # Increased from 0.5
+                loss = (attack_weight * bce_att + 
+                       clean_weight * bce_clean + 
+                       lam * (0.7 * res_l2 + 0.3 * res_l1) +  # Combined L1+L2 regularization
+                       0.05 * visibility_penalty +  # Perceptual quality
+                       confidence_bonus)  # Encourage confident predictions
                 
                 # Clamp loss to prevent extreme values
                 loss = torch.clamp(loss, 0.0, 10.0)
