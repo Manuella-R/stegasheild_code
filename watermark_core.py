@@ -1033,31 +1033,31 @@ def train_residual_encoder(
         # Report non-finite batch rate
         if total_batches_epoch > 0:
             failure_rate = nonfinite_count_epoch / total_batches_epoch
-            if failure_rate > 0.1:  # More than 10% failures
+            if failure_rate > 0.15:  # More than 15% failures - just report
                 print(f"⚠️ Non-finite loss rate: {failure_rate*100:.1f}% ({nonfinite_count_epoch}/{total_batches_epoch} batches)")
         
         # Dynamic attack cap adjustment - balanced approach
         # Reduce if accuracy is poor
-        if ema_acc < 0.58 and attack_limit > 0.15:
+        if ema_acc < 0.55 and attack_limit > 0.15:
             attack_limit = max(0.15, attack_limit * 0.85)
             print(f"📉 Accuracy low ({ema_acc*100:.1f}%), reducing attack_cap to {attack_limit:.2f}")
         
         # Reduce if residual is too high
-        if residual_ema > 0.14 and attack_limit > 0.15:
+        if residual_ema > 0.15 and attack_limit > 0.15:
             attack_limit = max(0.15, attack_limit * 0.90)
             print(f"📊 High residual ({residual_ema:.4f}), reducing attack_cap to {attack_limit:.2f}")
         
-        # Aggressively reduce if high failure rate
-        if nonfinite_count_epoch > len(dl) * 0.05:  # >5% failures
-            attack_limit = max(0.12, attack_limit * 0.6)
-            print(f"🔥 High failure rate, reducing attack_cap to {attack_limit:.2f}")
+        # Only reduce if SEVERE failure rate (tolerate occasional issues)
+        if nonfinite_count_epoch > len(dl) * 0.20:  # >20% failures
+            attack_limit = max(0.12, attack_limit * 0.7)
+            print(f"🔥 Severe failure rate ({failure_rate*100:.1f}%), reducing attack_cap to {attack_limit:.2f}")
         
-        # Increase attack if metrics are good (more relaxed conditions)
+        # Increase attack if metrics are decent (relaxed conditions)
         if (last_epoch_ema is not None and 
-            ema_acc > max(0.64, last_epoch_ema) and  # Stable or improving
-            residual_ema < 0.11 and 
-            nonfinite_count_epoch < len(dl) * 0.02):  # <2% failures
-            attack_limit = min(max_attack_strength, attack_limit + 0.02)
+            ema_acc >= max(0.62, last_epoch_ema - 0.01) and  # Stable (allow small drop)
+            residual_ema < 0.12 and 
+            nonfinite_count_epoch < len(dl) * 0.10):  # <10% failures is acceptable
+            attack_limit = min(max_attack_strength, attack_limit + 0.025)
             print(f"📈 Good progress, increasing attack_cap to {attack_limit:.2f}")
         
         attack_limit = float(max(0.12, min(max_attack_strength, attack_limit)))
